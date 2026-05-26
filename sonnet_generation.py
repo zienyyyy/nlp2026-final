@@ -56,13 +56,10 @@ class SonnetGPT(nn.Module):
       param.requires_grad = True
 
   def forward(self, input_ids, attention_mask):
-    """
-    ParaphraseGPT의 forward pass와 유사하지만, 여기서는 시퀀스의 마지막 토큰뿐만 아니라 시퀀스의 각 토큰에 대한 logit을 생성하려고 한다.
-    이를 통해, 마지막 토큰에 대한 다음 토큰의 분포만 학습하는 것이 아니라, 모델은 소네트를 구성하는 자연어 분포를 학습할 수 있다.
-    """
-    ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
-
+    gpt_output = self.gpt(input_ids, attention_mask)
+    hidden_states = gpt_output['last_hidden_state']
+    logits = self.gpt.hidden_state_to_token(hidden_states)
+    return logits
 
   def get_device(self):
     for param in self.gpt.parameters():
@@ -132,7 +129,7 @@ def save_model(model, optimizer, args, filepath):
 
 def train(args):
   """Sonnet 데이터셋에서 소넷 생성을 위해 GPT-2 훈련.""" 
-    device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   # 데이터, 해당 데이터셋 및 데이터로드 생성하기.
   sonnet_dataset = SonnetsDataset(args.sonnet_path)
   sonnet_dataloader = DataLoader(sonnet_dataset, shuffle=True, batch_size=args.batch_size,
