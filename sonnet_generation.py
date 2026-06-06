@@ -167,10 +167,10 @@ def train(args):
       best_loss = train_loss
       patience_counter = 0
       save_model(model, optimizer, args, f'best_{args.filepath}')
-      print(f"  → Best model 저장 (loss: {best_loss:.3f})")
+      print(f"  -> Best model 저장 (loss: {best_loss:.3f})")
     else:
       patience_counter += 1
-      print(f"  → Early stopping patience: {patience_counter}/{args.patience}")
+      print(f"  -> Early stopping patience: {patience_counter}/{args.patience}")
       if patience_counter >= args.patience:
         print(f"Early stopping at epoch {epoch}!")
         break
@@ -190,7 +190,6 @@ def generate_submission_sonnets(args):
   """최적 모델로 제출용 소넷 생성."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
 
-  # best 모델 우선, 없으면 마지막 epoch 모델 사용
   try:
     saved = torch.load(f'best_{args.filepath}', weights_only=False)
     print("best model 로드")
@@ -225,15 +224,19 @@ def generate_submission_sonnets(args):
 @torch.no_grad()
 def run_temperature_experiment(args):
   """
-  temperature와 top_p 조합별 소넷 생성 결과를 비교하는 실험.
-  각 조합으로 held-out 소넷 첫 번째를 생성하고 출력한다.
+  temperature와 top_p 조합별 chrF score를 계산하여 표로 출력한다.
+  held-out 소넷 전체에 대해 생성하고, train 소넷을 reference로 사용한다.
   """
+  from sacrebleu.metrics import CHRF
+
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
 
   try:
     saved = torch.load(f'best_{args.filepath}', weights_only=False)
+    print("best model 로드")
   except FileNotFoundError:
     saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+    print("마지막 epoch 모델 로드")
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -241,8 +244,13 @@ def run_temperature_experiment(args):
   model.eval()
 
   held_out_sonnet_dataset = SonnetsDataset(args.held_out_sonnet_path)
-  # 첫 번째 소넷 하나만 사용
-  sample = list(held_out_sonnet_dataset)[0]
+  train_sonnet_dataset = SonnetsDataset(args.sonnet_path)
+
+  samples = list(held_out_sonnet_dataset)       # 처음 3줄짜리 held-out 12개
+  train_samples = list(train_sonnet_dataset)    # reference용 train 소넷
+
+  # held-out 12개에 대응하는 reference (train 마지막 12개 사용)
+  references = [s[1] for s in train_samples[-len(samples):]]
 
   # 실험할 temperature / top_p 조합
   experiments = [
@@ -253,15 +261,37 @@ def run_temperature_experiment(args):
     (1.0, 0.7),
   ]
 
+  chrf = CHRF()
+  results = []
+
   print("\n" + "="*60)
   print("Temperature / Top-p 실험 결과")
   print("="*60)
 
   for temp, tp in experiments:
-    print(f"\n--- temperature={temp}, top_p={tp} ---")
-    encoding = model.tokenizer(sample[1], return_tensors='pt', padding=False, truncation=True).to(device)
-    _, output = model.generate(encoding['input_ids'], temperature=temp, top_p=tp)
-    print(f"{sample[1]}{output}\n")
+    hypotheses = []
+
+    for batch in samples:
+      prompt = batch[1]
+      encoding = model.tokenizer(prompt, return_tensors='pt', padding=False, truncation=True).to(device)
+      _, output = model.generate(encoding['input_ids'], temperature=temp, top_p=tp)
+      hypotheses.append(output)
+
+    score = chrf.corpus_score(hypotheses, [references]).score
+    results.append((temp, tp, score))
+    print(f"\n[temperature={temp}, top_p={tp}] chrF: {score:.4f}")
+    print(f"생성 예시:\n{samples[0][1]}{hypotheses[0]}\n")
+
+  # 결과 표
+  print("\n" + "="*60)
+  print(f"{'temperature':>12} | {'top_p':>6} | {'chrF score':>10}")
+  print("-"*36)
+  for temp, tp, score in results:
+    print(f"{temp:>12} | {tp:>6} | {score:>10.4f}")
+  print("="*60)
+
+  best = max(results, key=lambda x: x[2])
+  print(f"\n최고 성능: temperature={best[0]}, top_p={best[1]}, chrF={best[2]:.4f}")
 
 
 def get_args():
@@ -292,7 +322,7 @@ def get_args():
 
   # 실험 모드
   parser.add_argument("--run_experiment", action='store_true',
-                      help="temperature/top_p 실험 실행")
+                      help="temperature/top_p 실험 실행 (학습 후 chrF score 비교)")
 
   args = parser.parse_args()
   return args
