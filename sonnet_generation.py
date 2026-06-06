@@ -51,18 +51,18 @@ class SonnetGPT(nn.Module):
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    # 기본적으로, 전체 모델을 fine-tuning한다. TODO: 이것은 좋은 생각이 아닌 것 같다.
     for param in self.gpt.parameters():
       param.requires_grad = True
 
   def forward(self, input_ids, attention_mask):
     """
-    ParaphraseGPT의 forward pass와 유사하지만, 여기서는 시퀀스의 마지막 토큰뿐만 아니라 시퀀스의 각 토큰에 대한 logit을 생성하려고 한다.
-    이를 통해, 마지막 토큰에 대한 다음 토큰의 분포만 학습하는 것이 아니라, 모델은 소네트를 구성하는 자연어 분포를 학습할 수 있다.
+    시퀀스의 각 토큰에 대한 logit을 생성한다.
+    언어 모델링 학습을 위해 모든 토큰 위치의 logit을 반환한다.
     """
-    ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
-
+    gpt_output = self.gpt(input_ids, attention_mask)
+    hidden_states = gpt_output['last_hidden_state']
+    logits = self.gpt.hidden_state_to_token(hidden_states)
+    return logits
 
   def get_device(self):
     for param in self.gpt.parameters():
@@ -72,41 +72,30 @@ class SonnetGPT(nn.Module):
   def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
     """
     top-p sampling 과 softmax temperature를 사용하여 새로운 소넷을 생성한다.
-
-    TODO: 지금 이 방법은 기대 이하일 수 있다. 영감을 얻기 위해 Hugging Face의 model.generate(...) 함수를 참고해도 좋겠다.
-        여러 시퀀스를 생성하고 beam search를 통해 최적의 시퀀스를 선택하는 것도 좋은 한 가지 방법이다.
-        Top-k 샘플링 역시 또 다른 방법이며, 그 외에도 많은 접근법이 있다.
     """
     token_ids = encoding.to(self.get_device())
     attention_mask = torch.ones(token_ids.shape, dtype=torch.int64).to(self.get_device())
 
-
     for _ in range(max_length):
-      # logits을 구하기 위한 forward pass.
       logits_sequence = self.forward(token_ids, attention_mask)
-      logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
+      logits_last_token = logits_sequence[:, -1, :] / temperature
 
-      # Convert logits to probabilities
       probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
 
-      # Top-p (nucleus) sampling
       sorted_probs, sorted_indices = torch.sort(probs, descending=True)
       cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
       top_p_mask = cumulative_probs <= top_p
-      top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()  # Shift mask right for proper thresholding
-      top_p_mask[..., 0] = True  # Always include the highest probability token
-      filtered_probs = sorted_probs * top_p_mask  # Zero out unlikely tokens
-      filtered_probs /= filtered_probs.sum(dim=-1, keepdim=True)  # Normalize probabilities
+      top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()
+      top_p_mask[..., 0] = True
+      filtered_probs = sorted_probs * top_p_mask
+      filtered_probs /= filtered_probs.sum(dim=-1, keepdim=True)
 
-      # Sample from filtered distribution
       sampled_index = torch.multinomial(filtered_probs, 1)
       sampled_token = sorted_indices.gather(dim=-1, index=sampled_index)
 
-      # Stop if end-of-sequence token is reached
       if sampled_token.item() == self.tokenizer.eos_token_id:
         break
 
-      # Append sampled token
       token_ids = torch.cat([token_ids, sampled_token], dim=1)
       attention_mask = torch.cat(
         [attention_mask, torch.ones((1, 1), dtype=torch.int64).to(self.get_device())], dim=1
@@ -125,28 +114,29 @@ def save_model(model, optimizer, args, filepath):
     'numpy_rng': np.random.get_state(),
     'torch_rng': torch.random.get_rng_state(),
   }
-
   torch.save(save_info, filepath)
   print(f"save the model to {filepath}")
 
 
 def train(args):
-  """Sonnet 데이터셋에서 소넷 생성을 위해 GPT-2 훈련.""" 
-    device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  # 데이터, 해당 데이터셋 및 데이터로드 생성하기.
+  """Sonnet 데이터셋에서 소넷 생성을 위해 GPT-2 훈련. Early stopping 적용."""
+  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+
   sonnet_dataset = SonnetsDataset(args.sonnet_path)
   sonnet_dataloader = DataLoader(sonnet_dataset, shuffle=True, batch_size=args.batch_size,
                                  collate_fn=sonnet_dataset.collate_fn)
 
-  # held-out 데이터셋 만들기: 처음 3 줄만 있다. 나머지를 채우는 것은 여러분 몫이다!
   held_out_sonnet_dataset = SonnetsDataset(args.held_out_sonnet_path)
 
   args = add_arguments(args)
   model = SonnetGPT(args)
   model = model.to(device)
 
-  lr = args.lr
-  optimizer = AdamW(model.parameters(), lr=lr)
+  optimizer = AdamW(model.parameters(), lr=args.lr)
+
+  # Early stopping 설정
+  best_loss = float('inf')
+  patience_counter = 0
 
   for epoch in range(args.epochs):
     model.train()
@@ -154,16 +144,14 @@ def train(args):
     num_batches = 0
 
     for batch in tqdm(sonnet_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
-      # 입력을 가져와서 GPU로 보내기(이 모델을 CPU에서 훈련시키는 것을 권장하지 않는다).
       b_ids, b_mask = batch['token_ids'], batch['attention_mask']
       b_ids = b_ids.to(device)
       b_mask = b_mask.to(device)
 
-      # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트.
       optimizer.zero_grad()
       logits = model(b_ids, b_mask)
-      logits = rearrange(logits[:, :-1].contiguous(), 'b t d -> (b t) d')  # 시퀀스의 마지막 예측은 무시한다.
-      labels = b_ids[:, 1:].contiguous().flatten()  # 레이블을 구성하기 위해 첫번째 토큰을 무시한다.
+      logits = rearrange(logits[:, :-1].contiguous(), 'b t d -> (b t) d')
+      labels = b_ids[:, 1:].contiguous().flatten()
       loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
       optimizer.step()
@@ -172,7 +160,21 @@ def train(args):
       num_batches += 1
 
     train_loss = train_loss / num_batches
-    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
+    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}")
+
+    # Early stopping 체크
+    if train_loss < best_loss - args.min_delta:
+      best_loss = train_loss
+      patience_counter = 0
+      save_model(model, optimizer, args, f'best_{args.filepath}')
+      print(f"  → Best model 저장 (loss: {best_loss:.3f})")
+    else:
+      patience_counter += 1
+      print(f"  → Early stopping patience: {patience_counter}/{args.patience}")
+      if patience_counter >= args.patience:
+        print(f"Early stopping at epoch {epoch}!")
+        break
+
     print('Generating several output sonnets...')
     model.eval()
     for batch in held_out_sonnet_dataset:
@@ -180,21 +182,27 @@ def train(args):
       output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
       print(f'{batch[1]}{output[1]}\n\n')
 
-    # TODO: 소넷의 작은 테이터셋에서 과적합을 방지하기 위한 종료 조건을 생각하시오.
     save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
 
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
+  """최적 모델로 제출용 소넷 생성."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+
+  # best 모델 우선, 없으면 마지막 epoch 모델 사용
+  try:
+    saved = torch.load(f'best_{args.filepath}', weights_only=False)
+    print("best model 로드")
+  except FileNotFoundError:
+    saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+    print("마지막 epoch 모델 로드")
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
   model = model.to(device)
   model.eval()
 
-  # held-out 데이터셋 만들기: 처음 3 줄만 있다. 나머지를 채우는 것은 여러분 몫이다!
   held_out_sonnet_dataset = SonnetsDataset(args.held_out_sonnet_path)
 
   generated_sonnets = []
@@ -205,7 +213,6 @@ def generate_submission_sonnets(args):
     decoded_output = model.tokenizer.decode(output)
     full_sonnet = f'{decoded_output}\n\n'
     generated_sonnets.append((sonnet_id, full_sonnet))
-
     print(f'{decoded_output}\n\n')
 
   with open(args.sonnet_out, "w+") as f:
@@ -213,6 +220,48 @@ def generate_submission_sonnets(args):
     for sonnet in generated_sonnets:
       f.write(f"\n{sonnet[0]}\n")
       f.write(sonnet[1])
+
+
+@torch.no_grad()
+def run_temperature_experiment(args):
+  """
+  temperature와 top_p 조합별 소넷 생성 결과를 비교하는 실험.
+  각 조합으로 held-out 소넷 첫 번째를 생성하고 출력한다.
+  """
+  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+
+  try:
+    saved = torch.load(f'best_{args.filepath}', weights_only=False)
+  except FileNotFoundError:
+    saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+
+  model = SonnetGPT(saved['args'])
+  model.load_state_dict(saved['model'])
+  model = model.to(device)
+  model.eval()
+
+  held_out_sonnet_dataset = SonnetsDataset(args.held_out_sonnet_path)
+  # 첫 번째 소넷 하나만 사용
+  sample = list(held_out_sonnet_dataset)[0]
+
+  # 실험할 temperature / top_p 조합
+  experiments = [
+    (0.7, 0.9),
+    (1.0, 0.9),
+    (1.2, 0.9),
+    (0.7, 0.7),
+    (1.0, 0.7),
+  ]
+
+  print("\n" + "="*60)
+  print("Temperature / Top-p 실험 결과")
+  print("="*60)
+
+  for temp, tp in experiments:
+    print(f"\n--- temperature={temp}, top_p={tp} ---")
+    encoding = model.tokenizer(sample[1], return_tensors='pt', padding=False, truncation=True).to(device)
+    _, output = model.generate(encoding['input_ids'], temperature=temp, top_p=tp)
+    print(f"{sample[1]}{output}\n")
 
 
 def get_args():
@@ -226,22 +275,30 @@ def get_args():
   parser.add_argument("--epochs", type=int, default=10)
   parser.add_argument("--use_gpu", action='store_true')
 
-  # Generation parameters.
-  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)
-  parser.add_argument("--top_p", type=float, help="Cumulative probability distribution for nucleus sampling.",
-                      default=0.9)
+  # Generation parameters
+  parser.add_argument("--temperature", type=float, default=1.2)
+  parser.add_argument("--top_p", type=float, default=0.9)
 
-  parser.add_argument("--batch_size", help='The training batch size.', type=int, default=8)
-  parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
-  parser.add_argument("--model_size", type=str, help="The model size as specified on hugging face.",
+  parser.add_argument("--batch_size", type=int, default=8)
+  parser.add_argument("--lr", type=float, default=1e-5)
+  parser.add_argument("--model_size", type=str,
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
+
+  # Early stopping parameters
+  parser.add_argument("--patience", type=int, default=3,
+                      help="Early stopping patience: loss가 개선되지 않는 epoch 수 허용치")
+  parser.add_argument("--min_delta", type=float, default=0.001,
+                      help="Early stopping 최소 개선 기준값")
+
+  # 실험 모드
+  parser.add_argument("--run_experiment", action='store_true',
+                      help="temperature/top_p 실험 실행")
 
   args = parser.parse_args()
   return args
 
 
 def add_arguments(args):
-  """Add arguments that are deterministic on model size."""
   if args.model_size == 'gpt2':
     args.d = 768
     args.l = 12
@@ -261,7 +318,11 @@ def add_arguments(args):
 
 if __name__ == "__main__":
   args = get_args()
-  args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'  # 경로명 저장.
-  seed_everything(args.seed)  # 재현성을 위한 random seed 고정.
+  args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'
+  seed_everything(args.seed)
   train(args)
+
+  if args.run_experiment:
+    run_temperature_experiment(args)
+
   generate_submission_sonnets(args)
